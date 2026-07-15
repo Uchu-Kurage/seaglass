@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 /* ------------------------------------------------------------
    セーブ用ストレージ
@@ -363,6 +363,13 @@ export default function App() {
     })();
   }, []);
 
+  /* 表示用の浜(名前付き)。参照を安定させ、拾得のたびの再生成で
+     漂着物の位置がリセットされるのを防ぐ */
+  const beachView = useMemo(
+    () => (beach ? { ...beach, name: beachNames[beach.id] || beach.name } : null),
+    [beach, beachNames],
+  );
+
   const saveBeachName = useCallback((beachId, name) => {
     setBeachNames(prev => {
       const next = { ...prev, [beachId]: name };
@@ -407,7 +414,7 @@ export default function App() {
       )}
       {screen === "beach" && beach && (
         <BeachScene
-          beach={{ ...beach, name: beachNames[beach.id] || beach.name }}
+          beach={beachView}
           collection={collection}
           finds={finds}
           beachNames={beachNames}
