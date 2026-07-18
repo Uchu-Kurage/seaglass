@@ -90,6 +90,59 @@ async function saveTidePool(beach, data) {
   try { await storage.set(TIDEPOOL_KEY(beach.id), JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
 }
 
+/* ---------- 時化のあとの漂着(§3) ----------
+   前日の現実の天気が荒れていたら、翌朝の汀線に流木やレア色ガラスが打ち上がる。
+   その日・その浜につき一度だけ確定する朝のイベント(dateSeed で決定論・リロードで不変)。 */
+const STORM_GUST_KMH = 55;       // これ以上の最大瞬間風速(km/h)で時化寄り(要調整)
+const STORM_PRECIP_MM = 10;      // 前日降水合計の目安(mm)
+const STORM_THRESHOLD = 0.4;     // isStorm の閾値
+const STORM_GLASS = ["glass_red"];   // 時化限定のレア色(§4 の CORE_COLORS と一致)
+
+/* 前日(未明含む)の荒れ具合を過去hourlyから 0..1 に合成。マリンは使わず風＋降水で近似。
+   取得できなければ null を返し、呼び出し側で体験モード用の擬似値にフォールバックする。 */
+async function fetchStormIntensity(beach, todayDk) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6000);
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${beach.lat}&longitude=${beach.lon}&hourly=wind_gusts_10m,precipitation&past_days=1&forecast_days=1`;
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    const data = await res.json();
+    const time = data?.hourly?.time || [];
+    const gust = data?.hourly?.wind_gusts_10m || [];
+    const precip = data?.hourly?.precipitation || [];
+    let maxGust = 0, sumPrecip = 0, n = 0;
+    for (let i = 0; i < time.length; i++) {
+      if (time[i].slice(0, 10) >= todayDk) continue;   // 前日ぶんだけ(当日は除く)
+      maxGust = Math.max(maxGust, gust[i] ?? 0);
+      sumPrecip += precip[i] ?? 0;
+      n++;
+    }
+    if (n === 0) return null;
+    const gustPart = Math.min(1, maxGust / (STORM_GUST_KMH * 1.6));
+    const precipPart = Math.min(1, sumPrecip / (STORM_PRECIP_MM * 2));
+    return Math.min(1, 0.6 * gustPart + 0.4 * precipPart);
+  } catch { return null; }
+}
+/* その日の漂着を決定論生成(朝の一度きり)。個数は intensity に比例し小さく上限(1..5) */
+function generateWashups(dk, beach, intensity) {
+  if (intensity < STORM_THRESHOLD) return [];
+  const rng = dateSeed(dk, beach.id, "storm");
+  const count = Math.max(1, Math.min(5, Math.round(intensity * 4)));
+  const items = [];
+  for (let i = 0; i < count; i++) {
+    const isGlass = rng() < 0.35;   // 流木が主、レア色ガラスはときどき
+    const id = isGlass ? STORM_GLASS[Math.floor(rng() * STORM_GLASS.length)] : "driftwood";
+    items.push({ id, seed: (rng() * 1e9) | 0, rx: rng(), ry: rng(), appearedDate: dk });
+  }
+  return items;
+}
+/* 未採取のまま翌々日を迎えた個体を潮が引き取る(打ち上がった日と翌日いっぱいは残す) */
+function cleanWashups(items, todayDk) {
+  const today = dateKeyToMs(todayDk);
+  return items.filter(it => Math.round((today - dateKeyToMs(it.appearedDate)) / 86400000) <= 1);
+}
+
 /* ============================================================
    シーグラス — 浜辺を歩いて、海からの贈りものを探すゲーム
    ・実況天気(Open-Meteo)と連動。取得できない環境では体験モードに切替
@@ -137,10 +190,13 @@ const CATALOG = [
   { id: "glass_brown", cat: "シーグラス", name: "茶色のシーグラス", rarity: 3, glass: "#b98d5e", poem: "琥珀のような、あたたかい色。" },
   { id: "glass_aqua", cat: "シーグラス", name: "水色のシーグラス", rarity: 3, glass: "#9cc9d4", poem: "浅瀬の色を、そのまま閉じこめた。" },
   { id: "glass_blue", cat: "シーグラス", name: "青いシーグラス", rarity: 4, glass: "#5b7fb3", poem: "深い海の色。出会えたら幸運のしるし。" },
-  { id: "glass_red", cat: "シーグラス", name: "赤いシーグラス", rarity: 5, glass: "#c46a6a", poem: "千個にひとつの、いちばんの宝もの。" },
+  /* 赤は「この渚でいちばん稀な色」。時化のあとにだけ打ち上がる(通常スポーンには出さない) */
+  { id: "glass_red", cat: "シーグラス", name: "赤いシーグラス", rarity: 5, glass: "#c46a6a", storm: true, poem: "千個にひとつの、いちばんの宝もの。" },
   { id: "touhen", cat: "陶片", name: "陶片", rarity: 4, poem: "藍の絵付けが残るかけら。どんな器だったのだろう。" },
+  /* 流木:時化限定の収集物。大きめで、seed ごとに木肌と形が異なる */
+  { id: "driftwood", cat: "流木", name: "流木", rarity: 3, storm: true, poem: "遠い岸で朽ちて、長い旅のすえにここへ。潮の匂いが、まだ残っている。" },
 ];
-const CAT_ORDER = ["石", "貝殻", "シーグラス", "陶片"];
+const CAT_ORDER = ["石", "貝殻", "シーグラス", "流木", "陶片"];
 
 /* コレクションの値は数値(旧)またはオブジェクト(新)。両方から個数を取り出す */
 function entryCount(v) { return typeof v === "number" ? v : v?.count || 0; }
@@ -162,6 +218,8 @@ const dateKey = (t) => {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 };
+/* dateKey → ローカル深夜0時のミリ秒(日数差の計算に使う) */
+const dateKeyToMs = (dk) => new Date(`${dk}T00:00:00`).getTime();
 
 /* 文字列 → 32bit シード(xmur3 相当)。dateSeed のハッシュに使う */
 function hashString(str) {
@@ -269,7 +327,8 @@ function rollItem(weather, beach, rnd = Math.random) {
   if (cat === "石") return pickWeighted(beach?.stones || DEFAULT_STONES, rnd);
   if (cat === "貝殻") return pickWeighted([["futamaigai", 50], ["makigai", 35], ["sakuragai", 15]], rnd);
   if (cat === "陶片") return "touhen";
-  return pickWeighted([["glass_green", 34], ["glass_white", 26], ["glass_brown", 16], ["glass_aqua", 12], ["glass_blue", 9], ["glass_red", 3]], rnd);
+  /* 赤(glass_red)は通常スポーンに出さない。時化の漂着(§3)でのみ入手できる */
+  return pickWeighted([["glass_green", 34], ["glass_white", 26], ["glass_brown", 18], ["glass_aqua", 13], ["glass_blue", 9]], rnd);
 }
 
 /* ---------- 色ユーティリティ ---------- */
@@ -370,6 +429,40 @@ function drawItem(ctx, id, seed, s) {
     ctx.beginPath(); ctx.moveTo(-9 * s, 6 * s); ctx.quadraticCurveTo(0, 0, 9 * s, 5 * s); ctx.stroke();
     ctx.restore();
     ctx.strokeStyle = "rgba(120,115,100,0.5)"; ctx.lineWidth = 0.7 * s; poly(ctx, pts); ctx.stroke();
+  } else if (id === "driftwood") {
+    /* 流木:横に長い、潮に洗われた枝。seed で反り・木肌が一点ずつ変わる */
+    const len = 11 * s, th = (4 + rnd() * 1.6) * s;    // 長さと太さ(石より大きめ)
+    const bend = (rnd() - 0.5) * 4.5 * s;                // ゆるやかな反り
+    const g = ctx.createLinearGradient(0, -th, 0, th);
+    g.addColorStop(0, "#a8977c"); g.addColorStop(0.5, "#8a795f"); g.addColorStop(1, "#6f5f49");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(-len, 0);
+    ctx.quadraticCurveTo(-len * 0.5, -th + bend, 0, -th * 0.85);
+    ctx.quadraticCurveTo(len * 0.6, -th * 0.7 + bend, len, -th * 0.4);
+    ctx.quadraticCurveTo(len + th, 0, len, th * 0.4);
+    ctx.quadraticCurveTo(len * 0.6, th * 0.7 + bend, 0, th * 0.85);
+    ctx.quadraticCurveTo(-len * 0.5, th + bend, -len, 0);
+    ctx.closePath(); ctx.fill();
+    /* 木目と、洗われて色の抜けた木口 */
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(-len, 0);
+    ctx.quadraticCurveTo(-len * 0.5, -th + bend, 0, -th * 0.85);
+    ctx.quadraticCurveTo(len * 0.6, -th * 0.7 + bend, len, -th * 0.4);
+    ctx.quadraticCurveTo(len + th, 0, len, th * 0.4);
+    ctx.quadraticCurveTo(len * 0.6, th * 0.7 + bend, 0, th * 0.85);
+    ctx.quadraticCurveTo(-len * 0.5, th + bend, -len, 0);
+    ctx.closePath(); ctx.clip();
+    ctx.strokeStyle = "rgba(60,48,34,0.4)"; ctx.lineWidth = 0.7 * s;
+    for (let i = 0; i < 3; i++) {
+      const oy = (-2 + i * 2 + (rnd() - 0.5)) * s;
+      ctx.beginPath(); ctx.moveTo(-len, oy);
+      ctx.quadraticCurveTo(0, oy + bend * 0.4, len, oy * 0.6); ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(240,232,218,0.5)"; ctx.lineWidth = 1.1 * s;
+    ctx.beginPath(); ctx.ellipse(len, 0, th * 0.5, th * 0.7, 0, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+    ctx.restore();
   } else {
     /* シーグラス:すりガラスの質感と、稀少色のほのかな光 */
     const c = def.glass;
@@ -768,6 +861,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
   const shoreRef = useRef(null);                          // 渚の状態 {items,lastWash,day,dayCount}
   const tideRef = useRef(0);                              // 現在の潮位 tideLevel(1分tickで更新)
   const tidePoolRef = useRef(null);                       // 潮間帯の個体 {day,items:[{id,seed,rx,ry}]}
+  const washupsRef = useRef(null);                        // 時化の漂着 {lastCheckedDate,stormedToday,items:[...]}
 
   const persistShore = useCallback(() => {
     const s = shoreRef.current; if (!s) return;
@@ -777,6 +871,11 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
   const persistTidePool = useCallback(() => {
     const s = tidePoolRef.current; if (!s) return;
     saveTidePool({ id: beach.id }, s);
+  }, [beach.id]);
+
+  const persistWashups = useCallback(() => {
+    const s = washupsRef.current; if (!s) return;
+    saveWashups(beach.id, s);
   }, [beach.id]);
 
   /* --- 渚の状態を読み込み、経過時間ぶん進める --- */
@@ -815,6 +914,33 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const iv = setInterval(tick, 60_000);
     return () => clearInterval(iv);
   }, [beach.id, beach.lon]);
+
+  /* --- 時化の漂着:朝の一度きり。清掃 → 前日天気の取得 → 当日ぶんの生成(§3.5) --- */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const today = dateKey(Date.now());
+      const stored = await loadWashups(beach.id);   // {lastCheckedDate,items,...} 未定義はデフォルト補完
+      if (!alive) return;
+      let { lastCheckedDate, items } = stored;
+      let stormedToday = stored.stormedToday ?? false;
+      if (lastCheckedDate !== today) {
+        items = cleanWashups(items, today);                       // 翌々日を迎えた未採取分を潮が引き取る
+        const real = await fetchStormIntensity(beach, today);     // 前日天気(当日1回だけ)
+        if (!alive) return;
+        /* 取得できない体験モードでは、日付と浜から決まる擬似強度で稀に打ち上げる */
+        const intensity = real != null ? real : dateSeed(today, beach.id, "storm-demo")() * 0.5;
+        const fresh = generateWashups(today, beach, intensity);   // appearedDate=today を付けて追加
+        items = items.concat(fresh);
+        stormedToday = fresh.length > 0;
+        lastCheckedDate = today;
+      }
+      const next = { lastCheckedDate, stormedToday, items };
+      washupsRef.current = next;
+      saveWashups(beach.id, next);
+    })();
+    return () => { alive = false; };
+  }, [beach.id, beach.lat, beach.lon]);
 
   /* --- 実況天気の取得(失敗時は体験モード) --- */
   useEffect(() => {
@@ -855,9 +981,9 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const ctx = cv.getContext("2d");
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     const S = stateRef.current = {
-      items: [], tideItems: [], bursts: [], sand: [], clouds: [], drops: [],
+      items: [], tideItems: [], stormItems: [], bursts: [], sand: [], clouds: [], drops: [],
       wet: 0, surge: 0, surgePhase: "idle", nextSurge: 4, surgePeak: 0,
-      tideLevel: null, tideSeeded: false,
+      tideLevel: null, tideSeeded: false, stormSeeded: false,
       t: 0, last: performance.now(), W: 0, H: 0, motion: reduce ? 0.45 : 1,
     };
 
@@ -882,13 +1008,19 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         if (it.y < S.H * 0.6 || it.y > S.H) it.y = S.H * (0.64 + Math.random() * 0.3);
         if (it.x < 24 || it.x > S.W - 24) it.x = 24 + Math.random() * (S.W - 48);
       }
-      /* 潮間帯の個体は相対座標から再配置(位置は決してリセットしない) */
+      /* 潮間帯・時化の個体は相対座標から再配置(位置は決してリセットしない) */
       if (S.tideItems) for (const it of S.tideItems) placeTideItem(it);
+      if (S.stormItems) for (const it of S.stormItems) placeStormItem(it);
     }
     /* 潮間帯バンド(高潮線〜低潮線の内側)へ相対座標をマップ */
     function placeTideItem(it) {
       it.x = 24 + it.rx * (S.W - 48);
       it.y = S.H * (0.44 + it.ry * 0.12);
+    }
+    /* 時化の漂着は汀線の帯(潮間帯より浜側、常に露出)へ */
+    function placeStormItem(it) {
+      it.x = 24 + it.rx * (S.W - 48);
+      it.y = S.H * (0.60 + it.ry * 0.10);
     }
     resize();
     window.addEventListener("resize", resize);
@@ -914,6 +1046,16 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         const it = { id: rec.id, seed: rec.seed, rx: rec.rx, ry: rec.ry };
         placeTideItem(it);
         S.tideItems.push(it);
+      }
+    }
+    /* 時化の漂着を相対座標から並べる(24個上限とは別枠) */
+    function seedStorm() {
+      const wu = washupsRef.current;
+      S.stormItems = [];
+      for (const rec of wu.items) {
+        const it = { id: rec.id, seed: rec.seed, rx: rec.rx, ry: rec.ry };
+        placeStormItem(it);
+        S.stormItems.push(it);
       }
     }
     /* 浜にいる間、1時間ごとに1個だけ打ち上げる(上限内で) */
@@ -953,8 +1095,9 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         if (S.H > 0 && shoreRef.current) { seedFromShore(); S.seeded = true; }
         else { S.raf = requestAnimationFrame(frame); return; }
       }
-      /* 潮間帯の個体は、データが届いてから一度だけ配置 */
+      /* 潮間帯・時化の個体は、データが届いてから一度だけ配置 */
       if (!S.tideSeeded && S.H > 0 && tidePoolRef.current) { seedTidePool(); S.tideSeeded = true; }
+      if (!S.stormSeeded && S.H > 0 && washupsRef.current) { seedStorm(); S.stormSeeded = true; }
       /* 潮位を1分tickの目標値へ滑らかに追従(段差を消す。潮は緩慢なので体感差なし) */
       const tideTarget = tideRef.current ?? 0;
       if (S.tideLevel == null) S.tideLevel = tideTarget;
@@ -1054,6 +1197,12 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         drawItem(ctx, it.id, it.seed, 1);
         ctx.restore();
       }
+      /* ---------- 時化の漂着(汀線の帯・常に露出) ---------- */
+      for (const it of S.stormItems) {
+        ctx.save(); ctx.translate(it.x, it.y);
+        drawItem(ctx, it.id, it.seed, 1);
+        ctx.restore();
+      }
 
       /* ---------- 海(半透明で、波を被ったものが透ける) ---------- */
       ctx.beginPath();
@@ -1142,6 +1291,25 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const S = stateRef.current; if (!S) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    /* 時化の漂着:汀線の帯に打ち上がった流木・レア色ガラス(24個上限とは別枠・常に採取可) */
+    for (let i = S.stormItems.length - 1; i >= 0; i--) {
+      const it = S.stormItems[i];
+      if ((x - it.x) ** 2 + (y - it.y) ** 2 < 32 ** 2) {
+        S.stormItems.splice(i, 1);
+        S.bursts.push({ x: it.x, y: it.y, r: 6, a: 0.8 });
+        const wu = washupsRef.current;
+        if (wu) {
+          const idx = wu.items.findIndex(r => r.seed === it.seed && r.id === it.id);
+          if (idx >= 0) wu.items.splice(idx, 1);
+          persistWashups();
+        }
+        const def = CATALOG.find(d => d.id === it.id);
+        onCollect(it.id, it.seed, beach.id);
+        setDiscovery({ ...def, seed: it.seed, count: entryCount(collection[it.id]) + 1 });
+        setHint(false);
+        return;
+      }
+    }
     /* 潮間帯の個体:干潮で汀線より浜側に露出しているものだけ拾える(24個上限とは別枠) */
     const waterline = S.H * (0.5 + (S.tideLevel ?? 0) * TIDE_RANGE);
     for (let i = S.tideItems.length - 1; i >= 0; i--) {
