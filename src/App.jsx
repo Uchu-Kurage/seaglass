@@ -60,6 +60,36 @@ async function saveBottles(data) {
   try { await storage.set(BOTTLES_KEY, JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
 }
 
+/* 潮間帯の個体(§2.4)。浜ごと・その日ぶんを決定論生成して持ち越す。
+   位置は相対座標 rx,ry(0..1)で保存 → 画面サイズ非依存・形も位置もリセットしない。 */
+const TIDEPOOL_KEY = (beachId) => `seaglass-tidepool-${beachId}`;
+function defaultTidePool() { return { day: null, items: [] }; }
+/* その日・その浜の潮間帯個体を dateSeed から確定生成(同時露出上限3) */
+function generateTidePool(dk, beach) {
+  const rng = dateSeed(dk, beach.id, "tide");
+  const count = 1 + Math.floor(rng() * 3);   // 1..3
+  const items = [];
+  for (let i = 0; i < count; i++) {
+    const id = rollItem(null, beach, rng);   // 天気非依存で決定論を保つ
+    const seed = (rng() * 1e9) | 0;
+    items.push({ id, seed, rx: rng(), ry: rng() });
+  }
+  return { day: dk, items };
+}
+async function loadTidePool(beach, dk) {
+  try {
+    const r = await storage.get(TIDEPOOL_KEY(beach.id));
+    if (r?.value) {
+      const s = { ...defaultTidePool(), ...JSON.parse(r.value) };
+      if (s.day === dk) return s;   // 当日分は採取状態ごと引き継ぐ
+    }
+  } catch { /* 初回は未保存 */ }
+  return generateTidePool(dk, beach);   // 翌日リセット:未採取分は海が引き取り、新しい今日の個体を出す
+}
+async function saveTidePool(beach, data) {
+  try { await storage.set(TIDEPOOL_KEY(beach.id), JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
+}
+
 /* ============================================================
    シーグラス — 浜辺を歩いて、海からの贈りものを探すゲーム
    ・実況天気(Open-Meteo)と連動。取得できない環境では体験モードに切替
@@ -161,6 +191,22 @@ function lunarAge(t = Date.now()) {
   return ((days % SYNODIC) + SYNODIC) % SYNODIC;
 }
 
+/* ---------- 潮の満ち引き(§2 潮位モデル) ----------
+   月齢のみから決定論的に近似する(航海用途ではない感覚重視の近似)。
+   tideLevel ∈ [−1(最干) .. +1(最満)]。座標は内部利用のみ・UIには一切出さない。 */
+const T_TIDE = 12.42;                 // 半日周潮(M2)の周期(時間)
+const TIDE_RANGE = 0.08;              // 汀線が上下する画面比(高さH基準の片振幅)
+const frac = (x) => x - Math.floor(x);
+function computeTide(now, beach) {
+  const hours = now / HOUR_MS;
+  const beachLagH = -(beach?.lon ?? 0) / 15;               // 経度から時差様のラグ(内部利用のみ)
+  const phase = frac((hours - beachLagH) / T_TIDE);        // 0..1。T_TIDE≠12h ゆえ毎日約50分ずれる
+  const baseHeight = Math.cos(2 * Math.PI * phase);        // +1 満潮 / −1 干潮
+  const springFactor = Math.abs(Math.cos(2 * Math.PI * lunarAge(now) / SYNODIC)); // 新月・満月で大
+  const amplitude = 0.55 + 0.45 * springFactor;            // 0.55..1.0(大潮/小潮)
+  return amplitude * baseHeight;
+}
+
 /* 保存された渚の状態を、経過時間ぶんだけ進める(浜を離れている間も貝は溜まる) */
 function advanceShore(stored, now, weather, beach) {
   let items = stored?.items ? [...stored.items] : null;
@@ -206,23 +252,24 @@ function codeToKind(code) {
 function isBonus(w) {
   return w && (w.kind === "rain" || w.kind === "snow" || (w.wind ?? 0) >= 25);
 }
-function pickWeighted(pairs) {
+function pickWeighted(pairs, rnd = Math.random) {
   const total = pairs.reduce((s, p) => s + p[1], 0);
-  let r = Math.random() * total;
+  let r = rnd() * total;
   for (const [v, w] of pairs) { r -= w; if (r <= 0) return v; }
   return pairs[0][0];
 }
-function rollItem(weather, beach) {
+/* rnd を渡すと決定論的に引ける(潮間帯の個体生成で使用)。省略時は従来どおり Math.random */
+function rollItem(weather, beach, rnd = Math.random) {
   const bonus = isBonus(weather);
   const cat = pickWeighted([
     ["石", bonus ? 28 : 40], ["貝殻", bonus ? 26 : 34],
     ["シーグラス", bonus ? 40 : 22], ["陶片", bonus ? 6 : 4],
-  ]);
+  ], rnd);
   /* 石は「その浜の地層」に応じた表から。浜が未指定なら無難な既定表を使う */
-  if (cat === "石") return pickWeighted(beach?.stones || DEFAULT_STONES);
-  if (cat === "貝殻") return pickWeighted([["futamaigai", 50], ["makigai", 35], ["sakuragai", 15]]);
+  if (cat === "石") return pickWeighted(beach?.stones || DEFAULT_STONES, rnd);
+  if (cat === "貝殻") return pickWeighted([["futamaigai", 50], ["makigai", 35], ["sakuragai", 15]], rnd);
   if (cat === "陶片") return "touhen";
-  return pickWeighted([["glass_green", 34], ["glass_white", 26], ["glass_brown", 16], ["glass_aqua", 12], ["glass_blue", 9], ["glass_red", 3]]);
+  return pickWeighted([["glass_green", 34], ["glass_white", 26], ["glass_brown", 16], ["glass_aqua", 12], ["glass_blue", 9], ["glass_red", 3]], rnd);
 }
 
 /* ---------- 色ユーティリティ ---------- */
@@ -719,10 +766,17 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
   const weatherRef = useRef(null);
   const stateRef = useRef(null);                          // アニメーション用の可変状態
   const shoreRef = useRef(null);                          // 渚の状態 {items,lastWash,day,dayCount}
+  const tideRef = useRef(0);                              // 現在の潮位 tideLevel(1分tickで更新)
+  const tidePoolRef = useRef(null);                       // 潮間帯の個体 {day,items:[{id,seed,rx,ry}]}
 
   const persistShore = useCallback(() => {
     const s = shoreRef.current; if (!s) return;
     try { storage.set(`seaglass-shore-${beach.id}`, JSON.stringify(s)); } catch { }
+  }, [beach.id]);
+
+  const persistTidePool = useCallback(() => {
+    const s = tidePoolRef.current; if (!s) return;
+    saveTidePool({ id: beach.id }, s);
   }, [beach.id]);
 
   /* --- 渚の状態を読み込み、経過時間ぶん進める --- */
@@ -741,6 +795,26 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     })();
     return () => { alive = false; };
   }, [beach.id, persistShore]);
+
+  /* --- 潮間帯の個体を読み込み(当日分は引き継ぎ、日が変われば新規生成) --- */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const pool = await loadTidePool({ id: beach.id, stones: beach.stones }, dateKey(Date.now()));
+      if (!alive) return;
+      tidePoolRef.current = pool;
+      persistTidePool();
+    })();
+    return () => { alive = false; };
+  }, [beach.id, beach.stones, persistTidePool]);
+
+  /* --- 潮位は1分ごとに更新(毎フレーム再計算しない)。描画は tideRef を読むだけ --- */
+  useEffect(() => {
+    const tick = () => { tideRef.current = computeTide(Date.now(), beach); };
+    tick();
+    const iv = setInterval(tick, 60_000);
+    return () => clearInterval(iv);
+  }, [beach.id, beach.lon]);
 
   /* --- 実況天気の取得(失敗時は体験モード) --- */
   useEffect(() => {
@@ -781,8 +855,9 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const ctx = cv.getContext("2d");
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     const S = stateRef.current = {
-      items: [], bursts: [], sand: [], clouds: [], drops: [],
+      items: [], tideItems: [], bursts: [], sand: [], clouds: [], drops: [],
       wet: 0, surge: 0, surgePhase: "idle", nextSurge: 4, surgePeak: 0,
+      tideLevel: null, tideSeeded: false,
       t: 0, last: performance.now(), W: 0, H: 0, motion: reduce ? 0.45 : 1,
     };
 
@@ -807,6 +882,13 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         if (it.y < S.H * 0.6 || it.y > S.H) it.y = S.H * (0.64 + Math.random() * 0.3);
         if (it.x < 24 || it.x > S.W - 24) it.x = 24 + Math.random() * (S.W - 48);
       }
+      /* 潮間帯の個体は相対座標から再配置(位置は決してリセットしない) */
+      if (S.tideItems) for (const it of S.tideItems) placeTideItem(it);
+    }
+    /* 潮間帯バンド(高潮線〜低潮線の内側)へ相対座標をマップ */
+    function placeTideItem(it) {
+      it.x = 24 + it.rx * (S.W - 48);
+      it.y = S.H * (0.44 + it.ry * 0.12);
     }
     resize();
     window.addEventListener("resize", resize);
@@ -823,6 +905,16 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         S.items.push({ id: rec.id, seed: rec.seed, ...spawnZone(), sparkle: 0, born: S.t });
       }
       setOnShore(S.items.length);
+    }
+    /* 潮間帯の個体を相対座標から並べる(潮位アニメとは分離。位置・形はリセットしない) */
+    function seedTidePool() {
+      const pool = tidePoolRef.current;
+      S.tideItems = [];
+      for (const rec of pool.items) {
+        const it = { id: rec.id, seed: rec.seed, rx: rec.rx, ry: rec.ry };
+        placeTideItem(it);
+        S.tideItems.push(it);
+      }
     }
     /* 浜にいる間、1時間ごとに1個だけ打ち上げる(上限内で) */
     function maybeWashUp() {
@@ -844,7 +936,9 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     /* サイズと渚データが確定してから初期配置 */
     if (S.H > 0 && shoreRef.current) { seedFromShore(); S.seeded = true; }
 
-    const foamBase = () => S.H * 0.5;
+    /* 汀線の基準Y。潮位で上下(満潮=下へ広がり浜を覆う / 干潮=上へ引いて浜が広がる)。
+       波の呼吸・大波(foamOff)はこの上に別途乗る。アイテム state とは完全分離。 */
+    const foamBase = () => S.H * (0.5 + (S.tideLevel ?? 0) * TIDE_RANGE);
 
     function frame(now) {
       const dt = Math.min(0.05, (now - S.last) / 1000);
@@ -859,6 +953,12 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         if (S.H > 0 && shoreRef.current) { seedFromShore(); S.seeded = true; }
         else { S.raf = requestAnimationFrame(frame); return; }
       }
+      /* 潮間帯の個体は、データが届いてから一度だけ配置 */
+      if (!S.tideSeeded && S.H > 0 && tidePoolRef.current) { seedTidePool(); S.tideSeeded = true; }
+      /* 潮位を1分tickの目標値へ滑らかに追従(段差を消す。潮は緩慢なので体感差なし) */
+      const tideTarget = tideRef.current ?? 0;
+      if (S.tideLevel == null) S.tideLevel = tideTarget;
+      else S.tideLevel += (tideTarget - S.tideLevel) * Math.min(1, dt * 0.8);
 
       /* --- 大波の周期 --- */
       if (S.surgePhase === "idle" && t > S.nextSurge) { S.surgePhase = "run"; S.surgeT = 0; }
@@ -944,6 +1044,15 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
             ctx.stroke();
           }
         }
+      }
+
+      /* ---------- 潮間帯の個体 ----------
+         汀線基準より浜側なら露出、海側なら海ポリゴンが上に被さり水面下に透ける。
+         合図は「浜が広がること」だけ。ここでは何も演出しない(§2.5)。 */
+      for (const it of S.tideItems) {
+        ctx.save(); ctx.translate(it.x, it.y);
+        drawItem(ctx, it.id, it.seed, 1);
+        ctx.restore();
       }
 
       /* ---------- 海(半透明で、波を被ったものが透ける) ---------- */
@@ -1033,6 +1142,27 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const S = stateRef.current; if (!S) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    /* 潮間帯の個体:干潮で汀線より浜側に露出しているものだけ拾える(24個上限とは別枠) */
+    const waterline = S.H * (0.5 + (S.tideLevel ?? 0) * TIDE_RANGE);
+    for (let i = S.tideItems.length - 1; i >= 0; i--) {
+      const it = S.tideItems[i];
+      if (it.y <= waterline + 10) continue;   // 水面下は採取不可(潮が満ちれば再び覆われる)
+      if ((x - it.x) ** 2 + (y - it.y) ** 2 < 30 ** 2) {
+        S.tideItems.splice(i, 1);
+        S.bursts.push({ x: it.x, y: it.y, r: 6, a: 0.8 });
+        const pool = tidePoolRef.current;
+        if (pool) {
+          const idx = pool.items.findIndex(r => r.seed === it.seed && r.id === it.id);
+          if (idx >= 0) pool.items.splice(idx, 1);
+          persistTidePool();
+        }
+        const def = CATALOG.find(d => d.id === it.id);
+        onCollect(it.id, it.seed, beach.id);
+        setDiscovery({ ...def, seed: it.seed, count: entryCount(collection[it.id]) + 1 });
+        setHint(false);
+        return;
+      }
+    }
     for (let i = S.items.length - 1; i >= 0; i--) {
       const it = S.items[i];
       if ((x - it.x) ** 2 + (y - it.y) ** 2 < 30 ** 2) {
