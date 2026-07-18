@@ -24,6 +24,42 @@ const storage = {
   },
 };
 
+/* ------------------------------------------------------------
+   新規セーブキーの器(§1.3 / PR #3・#4 が実データを入れる)
+   いずれも上の storage 抽象化レイヤ経由。キーは seaglass- 接頭辞で統一。
+   読み込み時、未定義フィールドはデフォルトで補完する(後方互換 §5)。
+   ・時化のあとの漂着 … 浜ごと: seaglass-washups-<beachId>
+   ・稀に流れ着く小瓶 … 全体で1つ: seaglass-bottles
+   ------------------------------------------------------------ */
+const WASHUPS_KEY = (beachId) => `seaglass-washups-${beachId}`;
+const BOTTLES_KEY = "seaglass-bottles";
+
+function defaultWashups() { return { lastCheckedDate: null, items: [] }; }
+function defaultBottles() {
+  return { surfaceTriggered: 0, coreTriggered: 0, armed: [], collected: [], storyComplete: false };
+}
+
+async function loadWashups(beachId) {
+  try {
+    const r = await storage.get(WASHUPS_KEY(beachId));
+    if (r?.value) return { ...defaultWashups(), ...JSON.parse(r.value) };
+  } catch { /* 初回は未保存 */ }
+  return defaultWashups();
+}
+async function saveWashups(beachId, data) {
+  try { await storage.set(WASHUPS_KEY(beachId), JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
+}
+async function loadBottles() {
+  try {
+    const r = await storage.get(BOTTLES_KEY);
+    if (r?.value) return { ...defaultBottles(), ...JSON.parse(r.value) };
+  } catch { /* 初回は未保存 */ }
+  return defaultBottles();
+}
+async function saveBottles(data) {
+  try { await storage.set(BOTTLES_KEY, JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
+}
+
 /* ============================================================
    シーグラス — 浜辺を歩いて、海からの贈りものを探すゲーム
    ・実況天気(Open-Meteo)と連動。取得できない環境では体験モードに切替
@@ -86,22 +122,59 @@ const WASH_INTERVAL = HOUR_MS;   // およそ1時間に1個
 const DAILY_CAP = 24;            // 1日に打ち上がる上限
 const MAX_ON_SHORE = 12;         // 浜に同時に存在できる最大
 const FIRST_VISIT = 5;           // はじめて訪れたとき、すでにある数
-const dayKey = (t) => { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+/* ---------- 共有基盤:日付・決定論シード・月齢(§1 共通土台) ----------
+   日境界はローカル 0:00 に統一。潮・漂着・小瓶の"今日"判定と、
+   既存の1日上限リセットは、すべてこの dateKey 1本を参照する(二重定義しない)。 */
+
+/* 日付キー:ローカル暦の ISO 'YYYY-MM-DD'(ゼロ埋め)。ローカル 0:00 が日境界 */
+const dateKey = (t) => {
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+/* 文字列 → 32bit シード(xmur3 相当)。dateSeed のハッシュに使う */
+function hashString(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  h = Math.imul(h ^ (h >>> 16), 2246822507);
+  h = Math.imul(h ^ (h >>> 13), 3266489909);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+/* 決定論シード:同じ日・同じ浜・同じ用途なら、何度呼んでも同一系列を返す。
+   用途別 salt 例 — 潮 'tide' / 漂着 'storm' / 小瓶 'bottle'。既存 mulberry を再利用。
+   再描画やリロードで"今日の状態"が揺れないための土台(§1.1)。 */
+function dateSeed(dk, beachId, salt) {
+  return mulberry(hashString(`${dk}:${beachId}:${salt}`));
+}
+
+/* 月齢:新月からの経過日数(0..SYNODIC)。座標も数値も UI には出さない(§1.4)。
+   潮位モデル(PR #2)と、将来の満月機能が参照する唯一の実装。既存の月齢計算は無かったため新設。 */
+const SYNODIC = 29.530588853;                         // 朔望月(日)
+const NEW_MOON_EPOCH = Date.UTC(2000, 0, 6, 18, 14);  // 2000-01-06 18:14 UTC の新月を基準
+function lunarAge(t = Date.now()) {
+  const days = (t - NEW_MOON_EPOCH) / 86400000;
+  return ((days % SYNODIC) + SYNODIC) % SYNODIC;
+}
 
 /* 保存された渚の状態を、経過時間ぶんだけ進める(浜を離れている間も貝は溜まる) */
 function advanceShore(stored, now, weather, beach) {
   let items = stored?.items ? [...stored.items] : null;
   let lastWash = stored?.lastWash ?? now;
-  let day = stored?.day ?? dayKey(now);
+  let day = stored?.day ?? dateKey(now);
   let dayCount = stored?.dayCount ?? 0;
 
   if (items === null) {
     /* 初回訪問:すでにいくつか打ち上がっている(上限には数えない) */
     items = [];
     for (let i = 0; i < FIRST_VISIT; i++) items.push(newShoreItem(weather, beach));
-    return { items, lastWash: now, day: dayKey(now), dayCount: 0 };
+    return { items, lastWash: now, day: dateKey(now), dayCount: 0 };
   }
-  if (day !== dayKey(now)) { day = dayKey(now); dayCount = 0; }   // 日が変われば上限リセット
+  if (day !== dateKey(now)) { day = dateKey(now); dayCount = 0; }   // 日が変われば(ローカル0:00)上限リセット
 
   const fullHours = Math.floor((now - lastWash) / WASH_INTERVAL);
   let n = Math.max(0, Math.min(fullHours, DAILY_CAP - dayCount, MAX_ON_SHORE - items.length));
@@ -755,7 +828,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     function maybeWashUp() {
       const shore = shoreRef.current; if (!shore) return;
       const now = Date.now();
-      if (shore.day !== dayKey(now)) { shore.day = dayKey(now); shore.dayCount = 0; }
+      if (shore.day !== dateKey(now)) { shore.day = dateKey(now); shore.dayCount = 0; }
       if (S.items.length >= MAX_ON_SHORE) return;
       if (shore.dayCount >= DAILY_CAP) return;
       if (now - shore.lastWash < WASH_INTERVAL) return;
