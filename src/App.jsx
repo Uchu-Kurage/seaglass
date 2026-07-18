@@ -143,6 +143,62 @@ function cleanWashups(items, todayDk) {
   return items.filter(it => Math.round((today - dateKeyToMs(it.appearedDate)) / 86400000) <= 1);
 }
 
+/* ---------- 稀に流れ着く小瓶(§4) ----------
+   シーグラスの累計収集数がしきい値に達するごとに、断片を持つ小瓶が次の朝ひとつ流れ着く。
+   二系統:通常色=日常の層 / レア色(赤)=核心の層。両方を集めきると物語の全容が解ける。
+   断片テキストは docs/bottle-narrative.md の書き下ろし(完全オリジナル)。 */
+const SURFACE_COLORS = ["glass_green", "glass_white", "glass_brown", "glass_aqua", "glass_blue"];
+const CORE_COLORS = STORM_GLASS;   // レア色=赤。機能②の時化限定色と一致(§4.2)
+const SURFACE_COUNT = 5;           // 通常色を累計この数集めるごとに「日常」断片1つ
+const CORE_COUNT = 3;              // レア色を累計この数集めるごとに「核心」断片1つ
+const BOTTLE_MESSAGES = {
+  surface: [
+    { id: "s01", order: 1,  text: "今日も渚へ下りる。理由は、まだうまく言えない" },
+    { id: "s02", order: 3,  text: "拾うより先に、波の音を数える癖がついた" },
+    { id: "s03", order: 4,  text: "硝子は、割れてからの時間のほうがずっと長い" },
+    { id: "s04", order: 6,  text: "同じ場所へ二度は打ち上がらない。それでもわたしは、同じ渚へ通う" },
+    { id: "s05", order: 7,  text: "風のない朝は少し物足りない。荒れたあとの浜が、いちばん多くを返す" },
+    { id: "s06", order: 8,  text: "ポケットの中で拾ったものが鳴る。それだけで足りる日もある" },
+    { id: "s07", order: 10, text: "季節が一度めぐった。渚はわたしを覚えていない。忘れてもいない" },
+    { id: "s08", order: 11, text: "濡れた砂に膝をつく。その冷たさが、生きているほうの合図になる" },
+    { id: "s09", order: 13, text: "いつからか、両手を空けて歩く癖がついた。何かを受け取るために" },
+    { id: "s10", order: 14, text: "帰りぎわ、瓶の口を潮へ向ける。返すことも、待つことのうちだと知った" },
+  ],
+  core: [
+    { id: "c01", order: 2,  text: "海はいつか全部を返す、とあなたは言った。かたちを変えて、と" },
+    { id: "c02", order: 5,  text: "瓶に手紙を入れて流すのは、あなたが教えてくれた遊び。いくつかは、いつか返ると信じて" },
+    { id: "c03", order: 9,  text: "あなたが生涯さがしていたのは、赤。この渚でいちばん稀な色。とうとう見つからないまま、あなたは行った" },
+    { id: "c04", order: 12, text: "割れたものばかり、わたしは拾い集めている。あなたの分まで、と言えばうそになる。ただ、同じ場所を見ていたいだけ" },
+    { id: "c05", order: 15, text: "今朝、波の音がこう言った気がした。もう、探さなくていい。手のひらには、いつのまにか赤がひとつ。返されていたのは、わたしのほうだった" },
+  ],
+};
+/* 対象色群の累計収集数を既存の収集データから導出(専用カウンタは持たない・非消費) */
+function bottleColorCount(collection, colors) {
+  return colors.reduce((s, c) => s + entryCount(collection[c]), 0);
+}
+/* その色をいちばん最近拾った浜(小瓶が流れ着く先 foundBeach) */
+function lastFindBeach(finds, colors) {
+  for (let i = finds.length - 1; i >= 0; i--) if (colors.includes(finds[i].id)) return finds[i].beachId;
+  return null;
+}
+/* そのプールの次の未取得断片(順送り) */
+function nextFragment(pool, collected) {
+  const got = new Set(collected.filter(c => c.pool === pool).map(c => c.id));
+  return BOTTLE_MESSAGES[pool].find(f => !got.has(f.id));
+}
+/* 両プールを集めきったか(全容が解ける) */
+function isStoryComplete(collected) {
+  const s = collected.filter(c => c.pool === "surface").length;
+  const c = collected.filter(c => c.pool === "core").length;
+  return s >= BOTTLE_MESSAGES.surface.length && c >= BOTTLE_MESSAGES.core.length;
+}
+/* この浜で今朝ひらく小瓶を1本選ぶ(前夜までにアーム済み・同時到達は核心優先) */
+function pickPresentBottle(bottles, beachId, todayDk) {
+  const due = bottles.armed.filter(a => a.armedDate < todayDk && a.foundBeach === beachId);
+  due.sort((x, y) => (x.pool === y.pool ? 0 : x.pool === "core" ? -1 : 1));
+  return due[0] || null;
+}
+
 /* ============================================================
    シーグラス — 浜辺を歩いて、海からの贈りものを探すゲーム
    ・実況天気(Open-Meteo)と連動。取得できない環境では体験モードに切替
@@ -478,6 +534,49 @@ function drawItem(ctx, id, seed, s) {
     ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 0.8 * s;
     poly(ctx, pts, 3 * s); ctx.stroke();
   }
+  ctx.restore();
+}
+/* 小瓶(§4)。汀線に横たわる手紙入りのガラス瓶。pool で硝子の色みが変わる。
+   日常=淡い海の色 / 核心=赤み。seed で傾き・中の紙が一点ずつ変わる。 */
+function drawBottle(ctx, seed, pool, s) {
+  const rnd = mulberry(seed);
+  ctx.save();
+  ctx.rotate((rnd() - 0.5) * 0.5 - 0.12);   // 少し傾いて横たわる
+  /* 影 */
+  ctx.save();
+  ctx.translate(1.5 * s, 2.6 * s);
+  ctx.fillStyle = "rgba(70,60,45,0.22)";
+  ctx.beginPath(); ctx.ellipse(0, 0, 13 * s, 5 * s, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  const glass = pool === "core" ? "rgba(196,106,106,0.5)" : "rgba(150,196,178,0.48)";
+  const rim = pool === "core" ? "rgba(230,165,155,0.9)" : "rgba(210,235,225,0.9)";
+  /* 胴〜首〜口 */
+  ctx.beginPath();
+  ctx.moveTo(-11 * s, -5 * s);
+  ctx.lineTo(6 * s, -5 * s);
+  ctx.lineTo(9 * s, -3 * s);
+  ctx.lineTo(12.5 * s, -2.6 * s);
+  ctx.lineTo(12.5 * s, 2.6 * s);
+  ctx.lineTo(9 * s, 3 * s);
+  ctx.lineTo(6 * s, 5 * s);
+  ctx.lineTo(-11 * s, 5 * s);
+  ctx.quadraticCurveTo(-14.5 * s, 0, -11 * s, -5 * s);
+  ctx.closePath();
+  ctx.fillStyle = glass; ctx.fill();
+  /* 中の、丸めた手紙 */
+  ctx.fillStyle = "rgba(245,238,220,0.85)";
+  ctx.beginPath(); ctx.ellipse(-3 * s, 0, 4.6 * s, 2.6 * s, 0.2, 0, Math.PI * 2); ctx.fill();
+  /* 縁とハイライト */
+  ctx.strokeStyle = rim; ctx.lineWidth = 0.9 * s;
+  ctx.beginPath();
+  ctx.moveTo(-11 * s, -5 * s); ctx.lineTo(6 * s, -5 * s); ctx.lineTo(9 * s, -3 * s); ctx.lineTo(12.5 * s, -2.6 * s);
+  ctx.lineTo(12.5 * s, 2.6 * s); ctx.lineTo(9 * s, 3 * s); ctx.lineTo(6 * s, 5 * s); ctx.lineTo(-11 * s, 5 * s);
+  ctx.quadraticCurveTo(-14.5 * s, 0, -11 * s, -5 * s); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 0.8 * s;
+  ctx.beginPath(); ctx.moveTo(-9 * s, -3.2 * s); ctx.lineTo(4 * s, -3.2 * s); ctx.stroke();
+  /* コルク */
+  ctx.fillStyle = "rgba(168,128,88,0.92)";
+  ctx.fillRect(12.5 * s, -2.4 * s, 2.6 * s, 4.8 * s);
   ctx.restore();
 }
 /* 石の肌合い。輪郭でクリップされた内側に描く前提 */
@@ -856,12 +955,16 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
   const [shelfPick, setShelfPick] = useState(null);       // 棚で拡大表示する個体
   const [hint, setHint] = useState(true);
   const [onShore, setOnShore] = useState(null);          // 浜にある数(潮が静かなときの案内用)
+  const [bottles, setBottles] = useState(null);           // 小瓶の状態(断片・アーム・全容)
+  const [fragment, setFragment] = useState(null);         // 小瓶を開いたときの断片モーダル
   const weatherRef = useRef(null);
   const stateRef = useRef(null);                          // アニメーション用の可変状態
   const shoreRef = useRef(null);                          // 渚の状態 {items,lastWash,day,dayCount}
   const tideRef = useRef(0);                              // 現在の潮位 tideLevel(1分tickで更新)
   const tidePoolRef = useRef(null);                       // 潮間帯の個体 {day,items:[{id,seed,rx,ry}]}
   const washupsRef = useRef(null);                        // 時化の漂着 {lastCheckedDate,stormedToday,items:[...]}
+  const bottlesRef = useRef(null);                        // 小瓶の状態(canvas/ロジック用のミラー)
+  const presentBottleRef = useRef(null);                  // 今この浜にひらいている小瓶 {pool,key,seed}
 
   const persistShore = useCallback(() => {
     const s = shoreRef.current; if (!s) return;
@@ -942,6 +1045,54 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     return () => { alive = false; };
   }, [beach.id, beach.lat, beach.lon]);
 
+  /* --- 小瓶:収集マイルストーンの判定とアーム、今朝ひらく1本の決定(§4.2) --- */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let b = bottlesRef.current;
+      if (!b) { b = await loadBottles(); if (!alive) return; }   // 全体で1つ。初回だけ読み込む
+      const today = dateKey(Date.now());
+      /* しきい値判定は既存の収集データから毎回導出(専用カウンタは持たない・非消費) */
+      const se = Math.min(Math.floor(bottleColorCount(collection, SURFACE_COLORS) / SURFACE_COUNT), BOTTLE_MESSAGES.surface.length);
+      const ce = Math.min(Math.floor(bottleColorCount(collection, CORE_COLORS) / CORE_COUNT), BOTTLE_MESSAGES.core.length);
+      let changed = false;
+      /* 跨いだぶんをアーム(即座には出さず、次の 0:00 に流れ着く)。二重発生は triggered で防ぐ */
+      while (b.surfaceTriggered < se) {
+        b.armed.push({ pool: "surface", foundBeach: lastFindBeach(finds, SURFACE_COLORS) || beach.id, armedDate: today });
+        b.surfaceTriggered++; changed = true;
+      }
+      while (b.coreTriggered < ce) {
+        b.armed.push({ pool: "core", foundBeach: lastFindBeach(finds, CORE_COLORS) || beach.id, armedDate: today });
+        b.coreTriggered++; changed = true;
+      }
+      bottlesRef.current = b;
+      if (changed) saveBottles(b);
+      if (!alive) return;
+      setBottles({ ...b });
+      /* この浜で今朝ひらく1本(前夜までにアーム済み) */
+      const present = pickPresentBottle(b, beach.id, today);
+      presentBottleRef.current = present
+        ? { pool: present.pool, key: `${present.pool}:${present.armedDate}:${present.foundBeach}`, seed: hashString(`${present.armedDate}:${beach.id}:${present.pool}`) }
+        : null;
+    })();
+    return () => { alive = false; };
+  }, [beach.id, collection, finds]);
+
+  /* 小瓶を開く:次の未取得断片を渡し、図書室へ加える(順送り。全容は両プール完走で解ける) */
+  const openBottle = useCallback((pool) => {
+    const b = bottlesRef.current; if (!b) return;
+    const today = dateKey(Date.now());
+    const frag = nextFragment(pool, b.collected);
+    const idx = b.armed.findIndex(a => a.pool === pool && a.armedDate < today && a.foundBeach === beach.id);
+    if (idx >= 0) b.armed.splice(idx, 1);
+    const wasComplete = b.storyComplete;
+    if (frag) b.collected.push({ pool, id: frag.id, order: frag.order, foundBeach: beach.id, dateKey: today });
+    b.storyComplete = isStoryComplete(b.collected);
+    bottlesRef.current = b; saveBottles(b); setBottles({ ...b });
+    presentBottleRef.current = null;
+    if (frag) setFragment({ ...frag, pool, storyJustComplete: b.storyComplete && !wasComplete });
+  }, [beach.id]);
+
   /* --- 実況天気の取得(失敗時は体験モード) --- */
   useEffect(() => {
     let alive = true;
@@ -981,7 +1132,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const ctx = cv.getContext("2d");
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     const S = stateRef.current = {
-      items: [], tideItems: [], stormItems: [], bursts: [], sand: [], clouds: [], drops: [],
+      items: [], tideItems: [], stormItems: [], bottle: null, bottleKey: null, bursts: [], sand: [], clouds: [], drops: [],
       wet: 0, surge: 0, surgePhase: "idle", nextSurge: 4, surgePeak: 0,
       tideLevel: null, tideSeeded: false, stormSeeded: false,
       t: 0, last: performance.now(), W: 0, H: 0, motion: reduce ? 0.45 : 1,
@@ -1011,6 +1162,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
       /* 潮間帯・時化の個体は相対座標から再配置(位置は決してリセットしない) */
       if (S.tideItems) for (const it of S.tideItems) placeTideItem(it);
       if (S.stormItems) for (const it of S.stormItems) placeStormItem(it);
+      if (S.bottle) placeBottle(S.bottle);
     }
     /* 潮間帯バンド(高潮線〜低潮線の内側)へ相対座標をマップ */
     function placeTideItem(it) {
@@ -1021,6 +1173,11 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     function placeStormItem(it) {
       it.x = 24 + it.rx * (S.W - 48);
       it.y = S.H * (0.60 + it.ry * 0.10);
+    }
+    /* 小瓶も汀線寄りに置く(漂着感) */
+    function placeBottle(b) {
+      b.x = 24 + b.rx * (S.W - 48);
+      b.y = S.H * (0.61 + b.ry * 0.07);
     }
     resize();
     window.addEventListener("resize", resize);
@@ -1057,6 +1214,16 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         placeStormItem(it);
         S.stormItems.push(it);
       }
+    }
+    /* 今朝ひらく小瓶を1本置く(なければ消す)。present の変化に追従 */
+    function seedBottle() {
+      const p = presentBottleRef.current;
+      S.bottleKey = p ? p.key : null;
+      if (!p) { S.bottle = null; return; }
+      const rng = mulberry(p.seed);
+      const b = { seed: p.seed, pool: p.pool, rx: rng(), ry: rng() };
+      placeBottle(b);
+      S.bottle = b;
     }
     /* 浜にいる間、1時間ごとに1個だけ打ち上げる(上限内で) */
     function maybeWashUp() {
@@ -1098,6 +1265,8 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
       /* 潮間帯・時化の個体は、データが届いてから一度だけ配置 */
       if (!S.tideSeeded && S.H > 0 && tidePoolRef.current) { seedTidePool(); S.tideSeeded = true; }
       if (!S.stormSeeded && S.H > 0 && washupsRef.current) { seedStorm(); S.stormSeeded = true; }
+      /* 小瓶は present の変化(出現・採取)に追従して置き直す */
+      if (S.H > 0 && S.bottleKey !== (presentBottleRef.current?.key ?? null)) seedBottle();
       /* 潮位を1分tickの目標値へ滑らかに追従(段差を消す。潮は緩慢なので体感差なし) */
       const tideTarget = tideRef.current ?? 0;
       if (S.tideLevel == null) S.tideLevel = tideTarget;
@@ -1203,6 +1372,12 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         drawItem(ctx, it.id, it.seed, 1);
         ctx.restore();
       }
+      /* ---------- 小瓶(汀線寄り。静かに、ひとつ) ---------- */
+      if (S.bottle) {
+        ctx.save(); ctx.translate(S.bottle.x, S.bottle.y);
+        drawBottle(ctx, S.bottle.seed, S.bottle.pool, 1);
+        ctx.restore();
+      }
 
       /* ---------- 海(半透明で、波を被ったものが透ける) ---------- */
       ctx.beginPath();
@@ -1291,6 +1466,15 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     const S = stateRef.current; if (!S) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    /* 小瓶:汀線にひらいた1本。開くと断片がひとつ、静かに届く */
+    if (S.bottle && (x - S.bottle.x) ** 2 + (y - S.bottle.y) ** 2 < 34 ** 2) {
+      const pool = S.bottle.pool;
+      S.bursts.push({ x: S.bottle.x, y: S.bottle.y, r: 6, a: 0.8 });
+      S.bottle = null; S.bottleKey = null;
+      setHint(false);
+      openBottle(pool);
+      return;
+    }
     /* 時化の漂着:汀線の帯に打ち上がった流木・レア色ガラス(24個上限とは別枠・常に採取可) */
     for (let i = S.stormItems.length - 1; i >= 0; i--) {
       const it = S.stormItems[i];
@@ -1459,6 +1643,44 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         </div>
       )}
 
+      {/* ---- 小瓶の断片モーダル(静かに、ひとつ) ---- */}
+      {fragment && (
+        <div onClick={() => setFragment(null)} style={{
+          position: "absolute", inset: 0, background: "rgba(30,42,44,0.5)",
+          display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 6,
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            ...uiPanel, background: "rgba(253,251,246,0.98)", width: 320, padding: "30px 28px 22px",
+            textAlign: "center", animation: "sg-rise .55s cubic-bezier(.2,.8,.3,1)",
+          }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.4em", opacity: 0.5 }}>
+              {fragment.pool === "core" ? "核 心 の 断 片" : "日 常 の 断 片"}
+            </div>
+            <div style={{ fontSize: 11.5, opacity: 0.5, marginTop: 10, letterSpacing: "0.1em" }}>
+              小瓶がひとつ、流れ着いていた
+            </div>
+            <div style={{ width: 34, height: 1, background: "#33413f33", margin: "20px auto" }} />
+            <p style={{ fontSize: 15, lineHeight: 2.1, opacity: 0.85, margin: "0 0 8px", letterSpacing: "0.04em" }}>
+              {fragment.text}
+            </p>
+            <div style={{ width: 34, height: 1, background: "#33413f33", margin: "20px auto 14px" }} />
+            <div style={{ fontSize: 11, opacity: 0.5, letterSpacing: "0.1em" }}>
+              図書室に、断片がひとつ加わった
+            </div>
+            {fragment.storyJustComplete && (
+              <div style={{ fontSize: 12, marginTop: 10, color: "#8a6a55", letterSpacing: "0.14em", lineHeight: 1.9 }}>
+                すべての断片が、そろった。<br />図書室で通しで読めます。
+              </div>
+            )}
+            <button onClick={() => setFragment(null)} style={{
+              marginTop: 18, fontFamily: "inherit", fontSize: 13, letterSpacing: "0.2em",
+              padding: "9px 26px", cursor: "pointer", background: "#33413f", color: "#f6f3ea",
+              border: "none", borderRadius: 3,
+            }}>そっと しまう</button>
+          </div>
+        </div>
+      )}
+
       {/* ---- 図鑑 ---- */}
       {showBook && (
         <div style={{
@@ -1468,7 +1690,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
           <div style={{ maxWidth: 620, margin: "0 auto" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
               <h2 style={{ margin: 0, fontSize: 24, fontWeight: 600, letterSpacing: "0.25em" }}>
-                {bookTab === "catalog" ? "図鑑" : "棚"}
+                {bookTab === "catalog" ? "図鑑" : bookTab === "shelf" ? "棚" : "断片"}
               </h2>
               <button onClick={() => setShowBook(false)} style={{ ...uiPanel, padding: "7px 16px", fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
                 浜へ戻る
@@ -1477,7 +1699,8 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
 
             {/* タブ */}
             <div style={{ display: "flex", gap: 22, borderBottom: "1px solid rgba(51,65,63,0.2)", marginBottom: 20 }}>
-              {[["catalog", `図鑑 ${foundCount}/${CATALOG.length}`], ["shelf", `棚 ${finds.length}`]].map(([k, label]) => (
+              {[["catalog", `図鑑 ${foundCount}/${CATALOG.length}`], ["shelf", `棚 ${finds.length}`],
+                ...(bottles?.collected?.length ? [["fragment", `断片 ${bottles.collected.length}/15`]] : [])].map(([k, label]) => (
                 <button key={k} onClick={() => setBookTab(k)} style={{
                   fontFamily: "inherit", fontSize: 14, letterSpacing: "0.15em", cursor: "pointer",
                   background: "none", border: "none", padding: "0 0 10px", color: "#33413f",
@@ -1547,6 +1770,61 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
                 </div>
               )
             )}
+
+            {bookTab === "fragment" && (() => {
+              const got = new Set((bottles?.collected || []).map(c => c.id));
+              const fragCard = (f, pool) => {
+                const has = got.has(f.id);
+                return (
+                  <div key={f.id} style={{
+                    border: "1px solid rgba(51,65,63,0.15)", borderRadius: 4,
+                    background: has ? "rgba(255,253,247,0.85)" : "rgba(220,216,205,0.32)",
+                    padding: "14px 16px", minHeight: 44, display: "flex", alignItems: "center",
+                  }}>
+                    {has
+                      ? <p style={{ margin: 0, fontSize: 13.5, lineHeight: 2, opacity: 0.82, letterSpacing: "0.03em" }}>{f.text}</p>
+                      : <span style={{ fontSize: 12, opacity: 0.4, letterSpacing: "0.3em" }}>── まだ 届いていない ──</span>}
+                  </div>
+                );
+              };
+              const layer = (pool, title, note) => (
+                <div style={{ marginBottom: 26 }}>
+                  <div style={{ fontSize: 13, letterSpacing: "0.3em", opacity: 0.6, borderBottom: "1px solid rgba(51,65,63,0.2)", paddingBottom: 6, marginBottom: 6 }}>{title}</div>
+                  <div style={{ fontSize: 11, opacity: 0.5, marginBottom: 12, letterSpacing: "0.06em" }}>{note}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {BOTTLE_MESSAGES[pool].map(f => fragCard(f, pool))}
+                  </div>
+                </div>
+              );
+              const whole = [
+                ...BOTTLE_MESSAGES.surface.map(f => ({ ...f, pool: "surface" })),
+                ...BOTTLE_MESSAGES.core.map(f => ({ ...f, pool: "core" })),
+              ].sort((a, b) => a.order - b.order);
+              return (
+                <div>
+                  <div style={{ fontSize: 12.5, opacity: 0.62, lineHeight: 2, marginBottom: 20, letterSpacing: "0.04em" }}>
+                    集めた硝子のお礼のように、小瓶がひとつ流れ着きます。<br />
+                    日常と核心、両方の断片がそろうと、一篇として通しで読めます。
+                  </div>
+                  {layer("surface", "日常の断片", "通常色の硝子を集めると届く")}
+                  {layer("core", "核心の断片", "赤 ── この渚でいちばん稀な色を集めると届く")}
+                  {bottles?.storyComplete && (
+                    <div style={{ marginTop: 10, border: "1px solid rgba(51,65,63,0.25)", borderRadius: 4, background: "rgba(252,250,244,0.7)", padding: "22px 22px 26px" }}>
+                      <div style={{ fontSize: 13, letterSpacing: "0.4em", opacity: 0.6, textAlign: "center", marginBottom: 18 }}>全 容</div>
+                      <div style={{ maxWidth: 460, margin: "0 auto" }}>
+                        {whole.map(f => (
+                          <div key={f.id} style={{
+                            fontSize: 14, lineHeight: 2.2, letterSpacing: "0.04em", opacity: 0.85,
+                            paddingLeft: f.pool === "core" ? 22 : 0,
+                            color: f.pool === "core" ? "#5c4a44" : "#33413f",
+                          }}>{f.text}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
