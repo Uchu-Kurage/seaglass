@@ -8,6 +8,7 @@
 - 石やシーグラスの形は一つずつ生成され、二度と同じ形にはなりません
 - 拾ったものは「棚」に一点ずつ並び、いつ・どの浜で拾ったかが記録されます
 - 漂着物はおよそ1時間に1個のペースで打ち上がり、浜を離れている間も溜まっていきます
+- PWA に対応。ホーム画面に追加すると、アプリのように全画面で開けます（一度読み込めばオフラインでも起動します）
 
 セーブデータはブラウザの `localStorage` に保存されます。
 
@@ -62,3 +63,4 @@ npm run preview
 - Vite 5
 - 天気: [Open-Meteo](https://open-meteo.com/)（APIキー不要）
 - フォント: Shippori Mincho（Google Fonts）
+- PWA: [vite-plugin-pwa](https://vite-pwa-org.netlify.app/)（Service Worker とマニフェストの生成）
