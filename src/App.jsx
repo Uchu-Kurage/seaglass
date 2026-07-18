@@ -868,7 +868,9 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
   }, [beach]);
 
   /* --- タップで拾う --- */
-  const onPointerDown = (e) => {
+  /* pointerdown ではなく click で拾う。pointerdown で拾うと、同じタップの直後に
+     発生する click が、開いたばかりの発見モーダルの背景に届いてすぐ閉じてしまう。 */
+  const onTapPick = (e) => {
     const S = stateRef.current; if (!S) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
@@ -904,7 +906,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
     <div style={{ position: "absolute", inset: 0 }}>
       <canvas
         ref={canvasRef}
-        onPointerDown={onPointerDown}
+        onClick={onTapPick}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: "pointer", touchAction: "manipulation" }}
       />
 
