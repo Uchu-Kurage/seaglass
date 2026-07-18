@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#dbeae6"/>
+      <stop offset="0.55" stop-color="#cfe4e2"/>
+      <stop offset="1" stop-color="#bcd6d3"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a9d0bb"/>
+      <stop offset="0.5" stop-color="#8fc4a2"/>
+      <stop offset="1" stop-color="#79b6a0"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.35" cy="0.3" r="0.8">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" fill="url(#sea)"/>
+  <g transform="translate(32,32) scale(0.78)">
+    <!-- 角の取れた磨りガラスの欠片 -->
+    <path transform="translate(-32,-32)"
+      d="M -118 -38
+         C -143 -108, -38 -148, 62 -128
+         C 172 -103, 217 -8, 192 87
+         C 172 172, 72 212, -28 192
+         C -118 172, -93 42, -118 -38 Z"
+      fill="url(#glass)" stroke="#ffffff" stroke-opacity="0.35" stroke-width="6"/>
+    <path transform="translate(-32,-32)"
+      d="M -118 -38
+         C -143 -108, -38 -148, 62 -128
+         C 172 -103, 217 -8, 192 87
+         C 172 172, 72 212, -28 192
+         C -118 172, -93 42, -118 -38 Z"
+      fill="url(#sheen)"/>
+  </g>
+</svg>
