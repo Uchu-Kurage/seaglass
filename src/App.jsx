@@ -258,6 +258,112 @@ const CAT_ORDER = ["石", "貝殻", "シーグラス", "流木", "陶片"];
 function entryCount(v) { return typeof v === "number" ? v : v?.count || 0; }
 function entrySeed(v) { return typeof v === "object" ? v?.seed : undefined; }
 
+/* ============================================================
+   目利き — 見どころ・眼のくらい・稀少の気づき(仕様 docs/feature-connoisseur.md)
+   個体の質は seed 由来で不変。専用の保存は持たず、seed と既存の収集データから
+   そのつど導く(形と同じく、後から変えない・リセットしない)。
+   文言は仕様 §1.1／§4 の語彙をそのまま用いる(新規に創作しない)。
+   ------------------------------------------------------------
+   ※ 見どころは硝子(シーグラス)の眼として立ち上がる。§1.1 の語彙(色・透明度・
+     かたち・磨き)はいずれも硝子を語る言葉で、窓辺=光の通り方で見える場所という
+     §3 の主題とも噛み合うため、叙情の一文は硝子個体にだけ添える。石・貝は従来
+     どおり浜と日付の記録で扱う。この線引きは調整余地あり(PR で相談)。
+   ============================================================ */
+/* 見どころの叙情語(数値は一切出さない・§1.1) */
+const CLARITY_WORDS = ["霧をふくむ", "すりガラスめく", "半ば透ける", "澄んでいる", "水のように澄んで"];
+const SHAPE_COMMON = ["角の残る", "平たく薄い", "まるみを帯びた", "ころんと丸い"];
+const SHAPE_RARE = ["しずくのかたち", "まんまる", "ちいさな心臓", "勾玉のよう"];
+const POLISH_WORDS = ["艶の残る", "ざらつきのある", "なめらかな", "霜をまとう", "深く凪いだ"];
+/* 色:既存の硝子色に叙情名(短い呼び名)を与える。常に見える軸 */
+const GLASS_COLOR_WORD = {
+  glass_white: "しろ", glass_green: "みどり", glass_aqua: "みずいろ",
+  glass_brown: "こはく", glass_blue: "あお", glass_red: "あか",
+};
+const SHAPE_RARE_AT = 0.85;    // これを超えると稀なかたち
+const CLARITY_HIGH_AT = 0.8;   // 際立つ澄み
+
+function isGlass(id) { return GLASS_COLOR_WORD[id] != null; }
+/* seed から質の内部値(0..1)を決定論的に引く。形と同じく後から変わらない */
+function curioQuality(seed) {
+  const rnd = mulberry(seed >>> 0);
+  return { clarity: rnd(), shape: rnd(), polish: rnd() };
+}
+function bandWord(v, words) { return words[Math.min(words.length - 1, Math.floor(v * words.length))]; }
+function shapeWord(q) {
+  if (q.shape >= SHAPE_RARE_AT) {
+    const i = Math.min(SHAPE_RARE.length - 1, Math.floor((q.shape - SHAPE_RARE_AT) / (1 - SHAPE_RARE_AT) * SHAPE_RARE.length));
+    return SHAPE_RARE[i];
+  }
+  const i = Math.min(SHAPE_COMMON.length - 1, Math.floor(q.shape / SHAPE_RARE_AT * SHAPE_COMMON.length));
+  return SHAPE_COMMON[i];
+}
+
+/* 収集した個体の総数(既存 collection から導出・保存しない) */
+function totalCollected(collection) {
+  return Object.values(collection || {}).reduce((s, v) => s + entryCount(v), 0);
+}
+/* 眼のくらい(単一の位)。総数から段階導出(§2)。過去の個体にも遡って効く。
+   くらい1:色のみ / 2(≈20):＋透明度 / 3(≈50):＋かたち / 4(≈100):＋磨き＋稀少 */
+function eyeLevel(collection) {
+  const t = totalCollected(collection);
+  if (t >= 100) return 4;
+  if (t >= 50) return 3;
+  if (t >= 20) return 2;
+  return 1;
+}
+/* 見どころの一文。眼のくらいが高いほど見える軸が増える(§1.1 テンプレート
+   `{磨き}、{透明度}{色}の、{かたち}`)。硝子以外は語彙が無いので null */
+function appraisalText(id, seed, level) {
+  if (!isGlass(id)) return null;
+  const color = GLASS_COLOR_WORD[id];
+  if (level <= 1) return color;
+  const q = curioQuality(seed);
+  const core = `${bandWord(q.clarity, CLARITY_WORDS)} ${color}`;
+  if (level === 2) return core;
+  if (level === 3) return `${core}の、${shapeWord(q)}`;
+  return `${bandWord(q.polish, POLISH_WORDS)}、${core}の、${shapeWord(q)}`;
+}
+/* 稀少の気づき(極控えめ・一言)。眼のくらい4で開く。§4 の語をそのまま。
+   順位は言わず、何が特別かでそっと言い換える(重なりは「宝」を優先) */
+function rarityWhisper(id, seed, level) {
+  if (level < 4 || !isGlass(id)) return null;
+  const q = curioQuality(seed);
+  const rareColor = id === "glass_red" || id === "glass_blue";
+  const rareShape = q.shape >= SHAPE_RARE_AT;
+  const highClarity = q.clarity >= CLARITY_HIGH_AT;
+  const overlap = (rareColor ? 1 : 0) + (rareShape ? 1 : 0) + (highClarity ? 1 : 0) >= 2;
+  if (overlap) return "これは、ちょっとした宝かもしれない";
+  if (id === "glass_red") return "これは、赤。この渚でいちばん遠い色";
+  if (id === "glass_blue") return "青は、めったに戻ってこない";
+  if (rareShape) return "こんなかたちに出会うのは、久しぶりだ";
+  if (highClarity) return "これほど澄んだものは、そうない";
+  return null;
+}
+
+/* ---------- 窓辺(飾る=厳選の所作・§3/§6) ----------
+   保存するのはプレイヤーの選択(窓辺に飾った個体と並び)だけ。seed+beachId+time で
+   袋の個体を参照し、描画に要る id も併せて持つ(質・稀少・くらいは保存しない)。
+   キーは seaglass-curio(seaglass- 接頭辞・抽象化レイヤ経由)。未定義は空表示へ。 */
+const CURIO_KEY = "seaglass-curio";
+function defaultCurio() { return { display: [] }; }
+async function loadCurio() {
+  try {
+    const r = await storage.get(CURIO_KEY);
+    if (r?.value) return { ...defaultCurio(), ...JSON.parse(r.value) };
+  } catch { /* 初回は未保存 */ }
+  return defaultCurio();
+}
+async function saveCurio(data) {
+  try { await storage.set(CURIO_KEY, JSON.stringify(data)); } catch { /* 容量超過等は無視 */ }
+}
+/* 窓辺の枠数(総数から導出・保存しない)。初期3、総数 60/150/300 で +1、上限6(§3) */
+function curioSlots(collection) {
+  const t = totalCollected(collection);
+  return Math.min(6, 3 + (t >= 60 ? 1 : 0) + (t >= 150 ? 1 : 0) + (t >= 300 ? 1 : 0));
+}
+/* 袋の個体と窓辺の一点が同じか(seed＋拾った時刻で一意に照合) */
+function sameFind(a, b) { return a.seed === b.seed && a.time === b.time; }
+
 /* ---------- 打ち上げのペース ---------- */
 const HOUR_MS = 60 * 60 * 1000;
 const WASH_INTERVAL = HOUR_MS;   // およそ1時間に1個
@@ -731,6 +837,7 @@ export default function App() {
   const [collection, setCollection] = useState({});
   const [finds, setFinds] = useState([]);             // 拾った全個体 {id,seed,beachId,time}
   const [beachNames, setBeachNames] = useState({});   // {beachId: 自分でつけた名前}
+  const [curio, setCurio] = useState({ display: [] });// 窓辺に飾った選択(§3)。質・くらいは保存しない
   const [fontReady, setFontReady] = useState(false);
 
   /* 明朝体を読み込み(失敗しても游明朝等にフォールバック) */
@@ -758,6 +865,7 @@ export default function App() {
         const r = await storage.get("seaglass-beach-names");
         if (r?.value) setBeachNames(JSON.parse(r.value));
       } catch { /* 初回は未保存 */ }
+      setCurio(await loadCurio());   // 未定義なら空表示(後方互換)
     })();
   }, []);
 
@@ -792,6 +900,28 @@ export default function App() {
     });
   }, []);
 
+  /* 窓辺に飾る:空いている最初の枠へ置く(枠は総数から導出。空きが無ければ何もしない) */
+  const displayInCurio = useCallback((find, slots) => {
+    setCurio(prev => {
+      const used = new Set(prev.display.map(d => d.slot));
+      let slot = -1;
+      for (let i = 0; i < slots; i++) if (!used.has(i)) { slot = i; break; }
+      if (slot < 0) return prev;
+      const entry = { id: find.id, seed: find.seed, beachId: find.beachId, time: find.time, slot };
+      const next = { ...prev, display: [...prev.display.filter(d => !sameFind(d, find)), entry] };
+      saveCurio(next);
+      return next;
+    });
+  }, []);
+  /* 窓辺からおろす(袋の個体データは変わらない。窓辺の参照を外すだけ) */
+  const undisplayCurio = useCallback((find) => {
+    setCurio(prev => {
+      const next = { ...prev, display: prev.display.filter(d => !sameFind(d, find)) };
+      saveCurio(next);
+      return next;
+    });
+  }, []);
+
   const font = `"Shippori Mincho","Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",serif`;
 
   return (
@@ -816,6 +946,9 @@ export default function App() {
           collection={collection}
           finds={finds}
           beachNames={beachNames}
+          curio={curio}
+          onDisplay={displayInCurio}
+          onUndisplay={undisplayCurio}
           onCollect={addToCollection}
           onLeave={() => setScreen("select")}
         />
@@ -946,13 +1079,14 @@ function NamingCeremony({ beach, onConfirm, onBack }) {
 /* ============================================================
    浜辺の画面
    ============================================================ */
-function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }) {
+function BeachScene({ beach, collection, finds, beachNames, curio, onDisplay, onUndisplay, onCollect, onLeave }) {
   const canvasRef = useRef(null);
   const [weather, setWeather] = useState(null);          // {kind,label,temp,wind,source}
   const [discovery, setDiscovery] = useState(null);       // 拾ったもののモーダル
   const [showBook, setShowBook] = useState(false);
-  const [bookTab, setBookTab] = useState("catalog");      // catalog(図鑑) | shelf(棚)
-  const [shelfPick, setShelfPick] = useState(null);       // 棚で拡大表示する個体
+  const [showWindow, setShowWindow] = useState(false);    // 窓辺(独立ビュー・§3)
+  const [bookTab, setBookTab] = useState("catalog");      // catalog(図鑑) | shelf(持ち帰りの袋)
+  const [shelfPick, setShelfPick] = useState(null);       // 袋/窓辺で開く個体詳細
   const [hint, setHint] = useState(true);
   const [onShore, setOnShore] = useState(null);          // 浜にある数(潮が静かなときの案内用)
   const [bottles, setBottles] = useState(null);           // 小瓶の状態(断片・アーム・全容)
@@ -1608,10 +1742,16 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
               }}>{v.label}</button>
           ))}
         </div>
-        <button onClick={() => setShowBook(true)}
-          style={{ ...uiPanel, padding: "10px 18px", fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
-          図鑑 <span style={{ fontSize: 11, opacity: 0.6 }}>{foundCount}/{CATALOG.length}</span>
-        </button>
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <button onClick={() => setShowWindow(true)}
+            style={{ ...uiPanel, padding: "10px 16px", fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
+            窓辺
+          </button>
+          <button onClick={() => setShowBook(true)}
+            style={{ ...uiPanel, padding: "10px 18px", fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
+            図鑑 <span style={{ fontSize: 11, opacity: 0.6 }}>{foundCount}/{CATALOG.length}</span>
+          </button>
+        </div>
       </div>
 
       {/* ---- 発見モーダル ---- */}
@@ -1690,7 +1830,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
           <div style={{ maxWidth: 620, margin: "0 auto" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
               <h2 style={{ margin: 0, fontSize: 24, fontWeight: 600, letterSpacing: "0.25em" }}>
-                {bookTab === "catalog" ? "図鑑" : bookTab === "shelf" ? "棚" : "断片"}
+                {bookTab === "catalog" ? "図鑑" : bookTab === "shelf" ? "持ち帰りの袋" : "断片"}
               </h2>
               <button onClick={() => setShowBook(false)} style={{ ...uiPanel, padding: "7px 16px", fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
                 浜へ戻る
@@ -1699,7 +1839,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
 
             {/* タブ */}
             <div style={{ display: "flex", gap: 22, borderBottom: "1px solid rgba(51,65,63,0.2)", marginBottom: 20 }}>
-              {[["catalog", `図鑑 ${foundCount}/${CATALOG.length}`], ["shelf", `棚 ${finds.length}`],
+              {[["catalog", `図鑑 ${foundCount}/${CATALOG.length}`], ["shelf", `袋 ${finds.length}`],
                 ...(bottles?.collected?.length ? [["fragment", `断片 ${bottles.collected.length}/15`]] : [])].map(([k, label]) => (
                 <button key={k} onClick={() => setBookTab(k)} style={{
                   fontFamily: "inherit", fontSize: 14, letterSpacing: "0.15em", cursor: "pointer",
@@ -1746,7 +1886,7 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
             {bookTab === "shelf" && (
               finds.length === 0 ? (
                 <div style={{ textAlign: "center", opacity: 0.5, fontSize: 13, letterSpacing: "0.1em", padding: "48px 0", lineHeight: 2 }}>
-                  まだ棚は空っぽです。<br />浜辺で拾ったものが、新しい順にここへ並びます。
+                  まだ袋は空っぽです。<br />浜辺で拾ったものが、新しい順にここへ並びます。
                 </div>
               ) : (
                 <div>
@@ -1829,36 +1969,128 @@ function BeachScene({ beach, collection, finds, beachNames, onCollect, onLeave }
         </div>
       )}
 
-      {/* ---- 棚の個体を拡大 ---- */}
+      {/* ---- 個体詳細(袋/窓辺から開く) ---- */}
       {shelfPick && (() => {
         const def = CATALOG.find(d => d.id === shelfPick.id);
         const beachLabel = beachNames?.[shelfPick.beachId] || BEACHES.find(b => b.id === shelfPick.beachId)?.name || "どこかの浜";
         const d = new Date(shelfPick.time);
         const dateStr = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
+        /* 見どころ・稀少・くらいはここで都度導出(保存しない)。眼が肥えるほど語が増える */
+        const level = eyeLevel(collection);
+        const look = appraisalText(shelfPick.id, shelfPick.seed, level);
+        const whisper = rarityWhisper(shelfPick.id, shelfPick.seed, level);
+        const displayed = curio.display.some(x => sameFind(x, shelfPick));
+        const slots = curioSlots(collection);
+        const hasRoom = curio.display.length < slots;
         return (
           <div onClick={() => setShelfPick(null)} style={{
             position: "absolute", inset: 0, background: "rgba(30,42,44,0.5)",
-            display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 5,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 7,
           }}>
             <div onClick={e => e.stopPropagation()} style={{
-              ...uiPanel, background: "rgba(253,251,246,0.97)", width: 290, padding: "26px 24px 20px",
+              ...uiPanel, background: "rgba(253,251,246,0.97)", width: 296, padding: "26px 24px 20px",
               textAlign: "center", animation: "sg-rise .4s cubic-bezier(.2,.8,.3,1)",
             }}>
               <div style={{ margin: "4px auto 6px", width: 130, height: 130, display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <ItemThumb id={shelfPick.id} seed={shelfPick.seed} size={130} scale={4.6} />
               </div>
               <div style={{ fontSize: 20, fontWeight: 600, letterSpacing: "0.12em" }}>{def?.name}</div>
-              <div style={{ fontSize: 12, margin: "7px 0 2px", color: "#8a7a55", letterSpacing: "0.3em" }}>
-                {"●".repeat(def?.rarity || 0)}{"○".repeat(5 - (def?.rarity || 0))}
-              </div>
-              <div style={{ fontSize: 11.5, opacity: 0.6, marginTop: 12, letterSpacing: "0.08em", lineHeight: 1.9 }}>
+              {/* 見どころ:叙情語のみ(数値・レア度★は出さない) */}
+              {look && (
+                <p style={{ fontSize: 13.5, lineHeight: 1.9, opacity: 0.8, margin: "12px 6px 0", letterSpacing: "0.06em" }}>
+                  {look}
+                </p>
+              )}
+              {whisper && (
+                <p style={{ fontSize: 12.5, lineHeight: 1.9, color: "#7d6a55", margin: "8px 6px 0", letterSpacing: "0.08em" }}>
+                  {whisper}
+                </p>
+              )}
+              <div style={{ fontSize: 11.5, opacity: 0.6, marginTop: 14, letterSpacing: "0.08em", lineHeight: 1.9 }}>
                 {beachLabel} にて<br />{dateStr} に拾う
               </div>
-              <button onClick={() => setShelfPick(null)} style={{
-                marginTop: 16, fontFamily: "inherit", fontSize: 12.5, letterSpacing: "0.2em",
-                padding: "8px 24px", cursor: "pointer", background: "#33413f", color: "#f6f3ea",
-                border: "none", borderRadius: 3,
-              }}>閉じる</button>
+              <div style={{ marginTop: 16, display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+                {displayed ? (
+                  <button onClick={() => onUndisplay(shelfPick)} style={{
+                    fontFamily: "inherit", fontSize: 12.5, letterSpacing: "0.18em", padding: "8px 22px",
+                    cursor: "pointer", background: "transparent", color: "#33413f",
+                    border: "1px solid rgba(51,65,63,0.3)", borderRadius: 3,
+                  }}>窓辺からおろす</button>
+                ) : hasRoom ? (
+                  <button onClick={() => onDisplay(shelfPick, slots)} style={{
+                    fontFamily: "inherit", fontSize: 12.5, letterSpacing: "0.18em", padding: "8px 22px",
+                    cursor: "pointer", background: "transparent", color: "#33413f",
+                    border: "1px solid rgba(51,65,63,0.3)", borderRadius: 3,
+                  }}>窓辺に飾る</button>
+                ) : (
+                  <div style={{ fontSize: 11, opacity: 0.5, letterSpacing: "0.12em" }}>
+                    窓辺は、いまいっぱい
+                  </div>
+                )}
+                <button onClick={() => setShelfPick(null)} style={{
+                  fontFamily: "inherit", fontSize: 12.5, letterSpacing: "0.2em", padding: "8px 24px",
+                  cursor: "pointer", background: "#33413f", color: "#f6f3ea", border: "none", borderRadius: 3,
+                }}>閉じる</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ---- 窓辺(独立ビュー・§3)。飾った数点だけを、時刻の光で静かに ---- */}
+      {showWindow && (() => {
+        const slots = curioSlots(collection);
+        const pal = scenePalette(new Date().getHours(), weather?.kind || "clear");
+        const bySlot = {};
+        for (const c of curio.display) bySlot[c.slot] = c;
+        const openBag = () => { setShowWindow(false); setShowBook(true); setBookTab("shelf"); };
+        return (
+          <div style={{
+            position: "absolute", inset: 0, overflowY: "auto", zIndex: 6,
+            background: `linear-gradient(180deg, ${pal.sky1} 0%, ${pal.sky2} 58%, #e7dcc0 100%)`,
+          }}>
+            <div style={{ maxWidth: 560, margin: "0 auto", padding: "28px 22px 48px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+                <h2 style={{ margin: 0, fontSize: 24, fontWeight: 600, letterSpacing: "0.3em" }}>窓辺</h2>
+                <button onClick={() => setShowWindow(false)} style={{ ...uiPanel, padding: "7px 16px", fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.15em" }}>
+                  浜へ戻る
+                </button>
+              </div>
+              <div style={{ fontSize: 12.5, opacity: 0.68, lineHeight: 2, marginBottom: 26, letterSpacing: "0.04em" }}>
+                袋から選んだ数点を、窓辺に。<br />光の差すたび、硝子は違う顔を見せます。
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 14 }}>
+                {Array.from({ length: slots }).map((_, i) => {
+                  const c = bySlot[i];
+                  if (!c) return (
+                    <button key={i} onClick={openBag} title="持ち帰りの袋から選ぶ" style={{
+                      aspectRatio: "1", border: "1px dashed rgba(51,65,63,0.22)", borderRadius: 6,
+                      background: "rgba(255,253,247,0.16)", cursor: "pointer", fontFamily: "inherit",
+                      color: "#33413f", opacity: 0.5, fontSize: 11, letterSpacing: "0.16em", padding: 8,
+                    }}>そっと 空けておく</button>
+                  );
+                  const def = CATALOG.find(x => x.id === c.id);
+                  const glow = def?.glass;
+                  return (
+                    <button key={i} onClick={() => setShelfPick({ id: c.id, seed: c.seed, beachId: c.beachId, time: c.time })} style={{
+                      aspectRatio: "1", border: "1px solid rgba(51,65,63,0.16)", borderRadius: 6, cursor: "pointer",
+                      fontFamily: "inherit", padding: 0, position: "relative", overflow: "hidden",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: `radial-gradient(circle at 50% 40%, rgba(255,250,235,${0.2 + pal.light * 0.5}), rgba(255,250,235,0) 72%), rgba(252,250,244,0.5)`,
+                    }}>
+                      {glow && <div style={{ position: "absolute", inset: 0, background: glow, opacity: 0.1 * pal.light, pointerEvents: "none" }} />}
+                      <div style={{ position: "relative", filter: `brightness(${0.85 + pal.light * 0.25})` }}>
+                        <ItemThumb id={c.id} seed={c.seed} size={92} scale={3.3} />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              {curio.display.length === 0 && (
+                <div style={{ textAlign: "center", opacity: 0.55, fontSize: 12, letterSpacing: "0.1em", marginTop: 28, lineHeight: 2 }}>
+                  枠をえらぶと、持ち帰りの袋がひらきます。<br />気に入った一片を、ここへ。
+                </div>
+              )}
             </div>
           </div>
         );
